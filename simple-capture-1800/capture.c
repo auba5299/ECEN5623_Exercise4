@@ -50,7 +50,7 @@
 //#define VRES_STR "240"
 
 //ITEMS FOR TIMEKEEPING
-#define SAMPLE_COUNT 120
+#define SAMPLE_COUNT 135
 
 static double acq_times_ms[SAMPLE_COUNT];
 static double proc_times_ms[SAMPLE_COUNT];
@@ -61,7 +61,7 @@ struct timespec t_frame_end[SAMPLE_COUNT];
 
 
 int g_frame_idx = 0;   // increments as count decrements
-int warmup_frames = 20; // discard first 20 frames
+int warmup_frames = 35; // discard first 20 frames
 
 static unsigned char convert_buf[MAX_WIDTH * MAX_HEIGHT];
 static unsigned char dest_buf[MAX_WIDTH * MAX_HEIGHT];
@@ -70,7 +70,7 @@ static unsigned char dest_buf[MAX_WIDTH * MAX_HEIGHT];
 // Format is used by a number of functions, so made as a file global
 static struct v4l2_format fmt;
 // always ignore first 20 frames
-int framecnt=-20;
+int framecnt=-35;
 
 enum io_method 
 {
@@ -94,7 +94,7 @@ struct buffer          *buffers;
 static unsigned int     n_buffers;
 static int              out_buf;
 static int              force_format=1;
-static int              frame_count = (120);
+static int              frame_count = (135);
 
 
 //TIME HELPERS
@@ -437,8 +437,9 @@ static void process_image(const void *p, int size)
             {
                 write_times_ms[g_frame_idx] = diff_ms(&t_write_start, &t_write_end);
             }
+            //prints removed now tht verified to work
             //printf("Dump YUYV converted to YY size %d\n", size);
-            syslog(LOG_INFO, "Frame %d saved", g_frame_idx);
+            //syslog(LOG_INFO, "Frame %d saved", g_frame_idx);
         }
     }
     else
