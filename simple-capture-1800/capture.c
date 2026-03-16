@@ -13,6 +13,7 @@
  * see http://linuxtv.org/docs.php for more information
  */
 
+#define __GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,7 @@
 #include <linux/videodev2.h>
 #include <syslog.h>
 #include <time.h>
+
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 //#define COLOR_CONVERT_RGB
@@ -174,7 +176,7 @@ static int xioctl(int fh, int request, void *arg)
         return r;
 }
 
-//AI was used to aid in the developmnt of this one helper function
+//AI was used to aid in the developmnt of this one helper function and the file dump
 static int save_final_pgm(const char *filename,
                           const unsigned char *buf,
                           int width, int height)
@@ -214,6 +216,52 @@ static int save_final_pgm(const char *filename,
     return 0;
 }
 
+//AI aided in this dump function for my timings 
+static int save_timings_csv(const char *filename,
+                            const double *acq, const double *proc,
+                            const double *write, const double *frame,
+                            int start_idx, int end_idx)
+{
+    if (!filename || start_idx > end_idx) return -1;
+
+    FILE *f = fopen(filename, "w");
+    if (!f) {
+        perror("fopen");
+        return -1;
+    }
+
+    /* Header */
+    fprintf(f, "index,acq_ms,proc_ms,write_ms,frame_ms\n");
+
+    /* Write rows for indices in [start_idx, end_idx] */
+    for (int i = start_idx; i <= end_idx; ++i) {
+        /* Print NaN as empty field so tools can ignore it */
+        if (isnan(acq[i]) && isnan(proc[i]) && isnan(write[i]) && isnan(frame[i])) {
+            /* all NaNs: write index with empty fields */
+            fprintf(f, "%d,, , ,\n", i);
+            continue;
+        }
+
+        /* Use empty fields for individual NaNs */
+        if (isnan(acq[i])) fprintf(f, "%d,,", i);
+        else fprintf(f, "%d,%.6f,", i, acq[i]);
+
+        if (isnan(proc[i])) fprintf(f, ",");
+        else fprintf(f, "%.6f,", proc[i]);
+
+        if (isnan(write[i])) fprintf(f, ",");
+        else fprintf(f, "%.6f,", write[i]);
+
+        if (isnan(frame[i])) fprintf(f, "\n");
+        else fprintf(f, "%.6f\n", frame[i]);
+    }
+
+    /* Ensure data hits disk for final verification */
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    return 0;
+}
 
 char ppm_header[]="P6\n#9999999999 sec 9999999999 msec \n"HRES_STR" "VRES_STR"\n255\n";
 char ppm_dumpname[]="frames/test0000.ppm";
@@ -389,7 +437,7 @@ static void process_image(const void *p, int size)
             {
                 write_times_ms[g_frame_idx] = diff_ms(&t_write_start, &t_write_end);
             }
-            printf("Dump YUYV converted to YY size %d\n", size);
+            //printf("Dump YUYV converted to YY size %d\n", size);
             syslog(LOG_INFO, "Frame %d saved", g_frame_idx);
         }
     }
@@ -520,7 +568,7 @@ static void mainloop(void)
                 if(nanosleep(&read_delay, &time_error) != 0)
                     perror("nanosleep");
                 else
-                    printf("time_error.tv_sec=%ld, time_error.tv_nsec=%ld\n", time_error.tv_sec, time_error.tv_nsec);
+                    //printf("time_error.tv_sec=%ld, time_error.tv_nsec=%ld\n", time_error.tv_sec, time_error.tv_nsec);
 
                 count--;
                 break;
@@ -1030,14 +1078,14 @@ int main(int argc, char **argv)
     // initialization of V4L2
     open_device();
     init_device();
-    openlog(argv[0], LOG_PID | LOG_CONS, LOG_USER);
+    openlog("capture", LOG_PID | LOG_CONS, LOG_USER);
     start_capturing();
 
     // service loop frame read
     mainloop();
 
     //calculate frame time 
-    for(int i = 0; i<g_frame_idx; i++){
+    for(int i = 0; i<g_frame_idx && i<SAMPLE_COUNT; i++){
         frame_times_ms[i] = diff_ms(&t_frame_start[i], &t_frame_end[i]);
     }
 
@@ -1050,7 +1098,7 @@ int main(int argc, char **argv)
     stats_t write_stats = compute_stats_range(write_times_ms, warmup_frames, g_frame_idx-1);
     stats_t frame_stats = compute_stats_range(frame_times_ms, warmup_frames, g_frame_idx-1);
 
-    syslog(LOG_INFO, "Capture complete: stored_samples=%d warmup=%d", g_frame_idx, warmup_frames);
+    syslog(LOG_INFO, "Capture complete with grayscale conversion: stored_samples=%d warmup=%d", g_frame_idx, warmup_frames);
 
     syslog(LOG_INFO, "Acquisition ms: mean=%.3f min=%.3f max=%.3f (n=%d)",
        acq_stats.mean, acq_stats.min, acq_stats.max, acq_stats.count);
@@ -1064,6 +1112,7 @@ int main(int argc, char **argv)
     syslog(LOG_INFO, "Full frame ms: mean=%.3f min=%.3f max=%.3f (n=%d)",
        frame_stats.mean, frame_stats.min, frame_stats.max, frame_stats.count);
 
+    save_timings_csv("timings.csv", acq_times_ms, proc_times_ms, write_times_ms, frame_times_ms, warmup_frames, (g_frame_idx-1));
 
     // shutdown of frame acquisition service
     stop_capturing();
