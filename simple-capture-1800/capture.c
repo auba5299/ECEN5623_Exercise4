@@ -30,7 +30,7 @@
 #include <sys/ioctl.h>
 #include <math.h>
 #include <linux/videodev2.h>
-
+#include <syslog.h>
 #include <time.h>
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
@@ -53,7 +53,9 @@
 static double acq_times_ms[SAMPLE_COUNT];
 static double proc_times_ms[SAMPLE_COUNT];
 static double write_times_ms[SAMPLE_COUNT];
-static double loop_times_ms[SAMPLE_COUNT];
+static double frame_times_ms[SAMPLE_COUNT];
+struct timespec t_frame_start[SAMPLE_COUNT];
+struct timespec t_frame_end[SAMPLE_COUNT];
 
 
 int g_frame_idx = 0;   // increments as count decrements
@@ -367,7 +369,7 @@ static void process_image(const void *p, int size)
             
         }
         clock_gettime(CLOCK_MONOTONIC, &t_proc_end);
-        if(g_frame_idx < SAMPLE_COUNT)
+                if(g_frame_idx < SAMPLE_COUNT)
             {
                 proc_times_ms[g_frame_idx] = diff_ms(&t_proc_start, &t_proc_end);
             }
@@ -379,13 +381,16 @@ static void process_image(const void *p, int size)
         {
              //copy over to destination and measure time
             clock_gettime(CLOCK_MONOTONIC, &t_write_start);
+            if (gray_bytes > sizeof(dest_buf)) errno_exit("frame too large");   //guard memcopy
             memcpy(dest_buf, convert_buf, gray_bytes);
             clock_gettime(CLOCK_MONOTONIC, &t_write_end);
+            clock_gettime(CLOCK_MONOTONIC, &t_frame_end[g_frame_idx]);
             if(g_frame_idx < SAMPLE_COUNT)
             {
                 write_times_ms[g_frame_idx] = diff_ms(&t_write_start, &t_write_end);
             }
             printf("Dump YUYV converted to YY size %d\n", size);
+            syslog(LOG_INFO, "Frame %d saved", g_frame_idx);
         }
     }
     else
@@ -406,14 +411,19 @@ static int read_frame(void)
     unsigned int i;
 
     switch (io)
-    
+    {
+
         // this is our method to take frames from system / kernel buffer
         case IO_METHOD_MMAP:
+            //timestamp entry to read case
+            
             CLEAR(buf);
 
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             buf.memory = V4L2_MEMORY_MMAP;
             clock_gettime(CLOCK_MONOTONIC, &t_acq_start);
+            clock_gettime(CLOCK_MONOTONIC, &t_frame_start[g_frame_idx]);
+            
             if (-1 == xioctl(fd, VIDIOC_DQBUF, &buf))
             {
                 switch (errno)
@@ -434,7 +444,6 @@ static int read_frame(void)
                 }
             }
             clock_gettime(CLOCK_MONOTONIC, &t_acq_end);
-            
             // store aquisition time in buffer for analysis
             if(g_frame_idx < SAMPLE_COUNT)
             {
@@ -448,7 +457,7 @@ static int read_frame(void)
                     errno_exit("VIDIOC_QBUF");
             break;
 
-    
+    }
 
     //printf("R");
     return 1;
@@ -460,8 +469,8 @@ static void mainloop(void)
     unsigned int count;
     struct timespec read_delay;
     struct timespec time_error;
-    struct timespec t_loop_start;
-    struct timespec t_loop_end;
+    struct timespec t_frame_start;
+    struct timespec t_frame_end;
 
 
     // Replace this with a sequencer DELAY
@@ -479,6 +488,7 @@ static void mainloop(void)
         
         for (;;)
         {
+ 
             fd_set fds;
             struct timeval tv;
             int r;
@@ -491,7 +501,6 @@ static void mainloop(void)
             tv.tv_usec = 0;
             //wait for frame or timeout
             r = select(fd + 1, &fds, NULL, NULL, &tv);
-            clock_gettime(CLOCK_MONOTONIC, &t_loop_start);
             //error
             if (-1 == r)
             {
@@ -499,7 +508,7 @@ static void mainloop(void)
                     continue;
                 errno_exit("select");
             }
-            //timeput
+            //timeout
             if (0 == r)
             {
                 fprintf(stderr, "select timeout\n");
@@ -519,12 +528,6 @@ static void mainloop(void)
 
             /* EAGAIN - continue select loop unless count done. */
             if(count <= 0) break;
-            clock_gettime(CLOCK_MONOTONIC, &t_loop_end);
-            if(g_frame_idx < SAMPLE_COUNT)
-            {
-                loop_times_ms[g_frame_idx] = diff_ms(&t_loop_start, &t_loop_end);
-            }
-
         }
 
         if(count <= 0) break;
@@ -1018,27 +1021,55 @@ int main(int argc, char **argv)
                 exit(EXIT_FAILURE);
         }
     }
+    //initialize timing arrays to NaN for safety
+    for (int k = 0; k < SAMPLE_COUNT; ++k) {
+    acq_times_ms[k] = proc_times_ms[k] = write_times_ms[k] = frame_times_ms[k] = NAN;
+    }
+
 
     // initialization of V4L2
     open_device();
     init_device();
+    openlog(argv[0], LOG_PID | LOG_CONS, LOG_USER);
     start_capturing();
 
     // service loop frame read
     mainloop();
 
+    //calculate frame time 
+    for(int i = 0; i<g_frame_idx; i++){
+        frame_times_ms[i] = diff_ms(&t_frame_start[i], &t_frame_end[i]);
+    }
+
     // save final image to show processing is proper
     save_final_pgm("final_gray.pgm", dest_buf, fmt.fmt.pix.width, fmt.fmt.pix.height);
 
     //compute stats on acq, convert, and write back
-    stats_t acq_stats = compute_stats_range(acq_time_ms, warmup_frames-1, SAMPLE_COUNT-1);
-    stats_t conv_stats = compute_stats_range(conv_time_ms, warmup_frames-1, SAMPLE_COUNT-1);
-    stats_t write_stats = compute_stats_range(write_time_ms, warmup_frames-1, SAMPLE_COUNT-1);
+    stats_t acq_stats = compute_stats_range(acq_times_ms, warmup_frames, g_frame_idx-1);
+    stats_t conv_stats = compute_stats_range(proc_times_ms, warmup_frames, g_frame_idx-1);
+    stats_t write_stats = compute_stats_range(write_times_ms, warmup_frames, g_frame_idx-1);
+    stats_t frame_stats = compute_stats_range(frame_times_ms, warmup_frames, g_frame_idx-1);
+
+    syslog(LOG_INFO, "Capture complete: stored_samples=%d warmup=%d", g_frame_idx, warmup_frames);
+
+    syslog(LOG_INFO, "Acquisition ms: mean=%.3f min=%.3f max=%.3f (n=%d)",
+       acq_stats.mean, acq_stats.min, acq_stats.max, acq_stats.count);
+
+    syslog(LOG_INFO, "Conversion ms: mean=%.3f min=%.3f max=%.3f (n=%d)",
+       conv_stats.mean, conv_stats.min, conv_stats.max, conv_stats.count);
+
+    syslog(LOG_INFO, "Write ms: mean=%.3f min=%.3f max=%.3f (n=%d)",
+       write_stats.mean, write_stats.min, write_stats.max, write_stats.count);
+
+    syslog(LOG_INFO, "Full frame ms: mean=%.3f min=%.3f max=%.3f (n=%d)",
+       frame_stats.mean, frame_stats.min, frame_stats.max, frame_stats.count);
+
 
     // shutdown of frame acquisition service
     stop_capturing();
     uninit_device();
     close_device();
     fprintf(stderr, "\n");
+    closelog();
     return 0;
 }

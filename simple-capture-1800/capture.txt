@@ -28,16 +28,16 @@
 #include <sys/time.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
-
+#include <math.h>
 #include <linux/videodev2.h>
-
+#include <syslog.h>
 #include <time.h>
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 //#define COLOR_CONVERT_RGB
 
-#define MAX_HEIGHT 1280 //using what I saw for bigbuff
-#define MAX_WIDTH 960   //using what I saw for bigbuff
+#define MAX_WIDTH 1280   //using what I saw for bigbuff
+#define MAX_HEIGHT 960 //using what I saw for bigbuff
 #define HRES 640
 #define VRES 480
 #define HRES_STR "640"
@@ -53,7 +53,9 @@
 static double acq_times_ms[SAMPLE_COUNT];
 static double proc_times_ms[SAMPLE_COUNT];
 static double write_times_ms[SAMPLE_COUNT];
-static double loop_times_ms[SAMPLE_COUNT];
+static double frame_times_ms[SAMPLE_COUNT];
+struct timespec t_frame_start[SAMPLE_COUNT];
+struct timespec t_frame_end[SAMPLE_COUNT];
 
 
 int g_frame_idx = 0;   // increments as count decrements
@@ -341,86 +343,55 @@ void yuv2rgb(int y, int u, int v, unsigned char *r, unsigned char *g, unsigned c
 static void process_image(const void *p, int size)
 {
     int i, out_i, newsize=0;
-    struct timespec frame_time;
-    int y_temp, y2_temp, u_temp, v_temp;
     unsigned char *pptr = (unsigned char *)p;
     struct timespec t_proc_start, t_proc_end, t_write_start, t_write_end;
-    size_t graybytes = (size_t) size/2; //grayscale conversion is half frame size
+    size_t gray_bytes = (size_t) size/2; //grayscale conversion is half frame size
 
     // record when process was called
-    clock_gettime(CLOCK_REALTIME, &frame_time);    
+    clock_gettime(CLOCK_MONOTONIC, &t_proc_start);
 
+    //increment frame counter, once crosses 0 begin saving frames
     framecnt++;
-    printf("frame %d: ", framecnt);
 
     // This just dumps the frame to a file now, but you could replace with whatever image
     // processing you wish.
-    //
 
-    if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_GREY)
+    if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV)
     {
-        printf("Dump graymap as-is size %d\n", size);
-        dump_pgm(p, size, framecnt, &frame_time);
-    }
-
-    else if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV)
-    {
-
-#if defined(COLOR_CONVERT_RGB)
-       
         // Pixels are YU and YV alternating, so YUYV which is 4 bytes
-        // We want RGB, so RGBRGB which is 6 bytes
-        //
-        for(i=0, out_i=0; i<size; i=i+4, out_i=out_i+6)
-        {
-            y_temp=(int)pptr[i]; u_temp=(int)pptr[i+1]; y2_temp=(int)pptr[i+2]; v_temp=(int)pptr[i+3];
-            yuv2rgb(y_temp, u_temp, v_temp, &convert_buf[out_i], &convert_buf[out_i+1], &convert_buf[out_i+2]);
-            yuv2rgb(y2_temp, u_temp, v_temp, &convert_buf[out_i+3], &convert_buf[out_i+4], &convert_buf[out_i+5]);
-        }
-
-        if(framecnt > -1) 
-        {
-            dump_ppm(convert_buf, ((size*6)/4), framecnt, &frame_time);
-            printf("Dump YUYV converted to RGB size %d\n", size);
-        }
-#else
-       
-        // Pixels are YU and YV alternating, so YUYV which is 4 bytes
-        // We want Y, so YY which is 2 bytes
-        //
+        // We want Y, so YY which is 2 bytes        
+        
         for(i=0, out_i=0; i+3<size && out_i < (int)gray_bytes; i=i+4, out_i=out_i+2) //added +3 for safety if not %4 for some reason
         {
-            clock_gettime(CLOCK_MONOTONIC, &t_proc_start);
             // Y1=first byte and Y2=third byte
             convert_buf[out_i]=pptr[i];
             convert_buf[out_i+1]=pptr[i+2];
-            clock_gettime(CLOCK_MONOTONIC, &t_proc_end);
-            if(g_frame_idx < SAMPLE_COUNT)
+            
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t_proc_end);
+                if(g_frame_idx < SAMPLE_COUNT)
             {
                 proc_times_ms[g_frame_idx] = diff_ms(&t_proc_start, &t_proc_end);
             }
-        }
 
+        
+        /*once past 20 frames, begin a memcpy. This mimics sending to output, so the location is overwritten and one final image is saved. No saving 
+        requirements were given in the assignment so hopefully this is all that was required.*/
         if(framecnt > -1)
         {
              //copy over to destination and measure time
-            clock_gettime(CLOCK_MONOTONIC, &t_write_start)
+            clock_gettime(CLOCK_MONOTONIC, &t_write_start);
+            if (gray_bytes > sizeof(dest_buf)) errno_exit("frame too large");   //guard memcopy
             memcpy(dest_buf, convert_buf, gray_bytes);
             clock_gettime(CLOCK_MONOTONIC, &t_write_end);
+            clock_gettime(CLOCK_MONOTONIC, &t_frame_end[g_frame_idx]);
             if(g_frame_idx < SAMPLE_COUNT)
             {
                 write_times_ms[g_frame_idx] = diff_ms(&t_write_start, &t_write_end);
             }
             printf("Dump YUYV converted to YY size %d\n", size);
+            syslog(LOG_INFO, "Frame %d saved", g_frame_idx);
         }
-#endif
-
-    }
-
-    else if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_RGB24)
-    {
-        printf("Dump RGB as-is size %d\n", size);
-        dump_ppm(p, size, framecnt, &frame_time);
     }
     else
     {
@@ -428,48 +399,31 @@ static void process_image(const void *p, int size)
     }
 
     fflush(stderr);
-    //fprintf(stderr, ".");
     fflush(stdout);
+    g_frame_idx++;
 }
 
 
 static int read_frame(void)
 {
-    struct timespec t_acq_start, t_acq_end
+    struct timespec t_acq_start, t_acq_end;
     struct v4l2_buffer buf;
     unsigned int i;
 
     switch (io)
     {
 
-        case IO_METHOD_READ:
-            if (-1 == read(fd, buffers[0].start, buffers[0].length))
-            {
-                switch (errno)
-                {
-
-                    case EAGAIN:
-                        return 0;
-
-                    case EIO:
-                        /* Could ignore EIO, see spec. */
-
-                        /* fall through */
-
-                    default:
-                        errno_exit("read");
-                }
-            }
-
-            process_image(buffers[0].start, buffers[0].length);
-            break;
         // this is our method to take frames from system / kernel buffer
         case IO_METHOD_MMAP:
+            //timestamp entry to read case
+            
             CLEAR(buf);
 
             buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             buf.memory = V4L2_MEMORY_MMAP;
             clock_gettime(CLOCK_MONOTONIC, &t_acq_start);
+            clock_gettime(CLOCK_MONOTONIC, &t_frame_start[g_frame_idx]);
+            
             if (-1 == xioctl(fd, VIDIOC_DQBUF, &buf))
             {
                 switch (errno)
@@ -490,7 +444,6 @@ static int read_frame(void)
                 }
             }
             clock_gettime(CLOCK_MONOTONIC, &t_acq_end);
-            
             // store aquisition time in buffer for analysis
             if(g_frame_idx < SAMPLE_COUNT)
             {
@@ -504,41 +457,6 @@ static int read_frame(void)
                     errno_exit("VIDIOC_QBUF");
             break;
 
-        case IO_METHOD_USERPTR:
-            CLEAR(buf);
-
-            buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-            buf.memory = V4L2_MEMORY_USERPTR;
-
-            if (-1 == xioctl(fd, VIDIOC_DQBUF, &buf))
-            {
-                switch (errno)
-                {
-                    case EAGAIN:
-                        return 0;
-
-                    case EIO:
-                        /* Could ignore EIO, see spec. */
-
-                        /* fall through */
-
-                    default:
-                        errno_exit("VIDIOC_DQBUF");
-                }
-            }
-
-            for (i = 0; i < n_buffers; ++i)
-                    if (buf.m.userptr == (unsigned long)buffers[i].start
-                        && buf.length == buffers[i].length)
-                            break;
-
-            assert(i < n_buffers);
-
-            process_image((void *)buf.m.userptr, buf.bytesused);
-
-            if (-1 == xioctl(fd, VIDIOC_QBUF, &buf))
-                    errno_exit("VIDIOC_QBUF");
-            break;
     }
 
     //printf("R");
@@ -551,8 +469,8 @@ static void mainloop(void)
     unsigned int count;
     struct timespec read_delay;
     struct timespec time_error;
-    struct timespec t_loop_start;
-    struct timespec t_loop_end;
+    struct timespec t_frame_start;
+    struct timespec t_frame_end;
 
 
     // Replace this with a sequencer DELAY
@@ -570,6 +488,7 @@ static void mainloop(void)
         
         for (;;)
         {
+ 
             fd_set fds;
             struct timeval tv;
             int r;
@@ -582,7 +501,6 @@ static void mainloop(void)
             tv.tv_usec = 0;
             //wait for frame or timeout
             r = select(fd + 1, &fds, NULL, NULL, &tv);
-            clock_gettime(CLOCK_MONOTONIC, &t_loop_start);
             //error
             if (-1 == r)
             {
@@ -590,7 +508,7 @@ static void mainloop(void)
                     continue;
                 errno_exit("select");
             }
-            //timeput
+            //timeout
             if (0 == r)
             {
                 fprintf(stderr, "select timeout\n");
@@ -609,14 +527,7 @@ static void mainloop(void)
             }
 
             /* EAGAIN - continue select loop unless count done. */
-            g_frame_idx++;
             if(count <= 0) break;
-            clock_gettime(CLOCK_MONOTONIC, &t_loop_end);
-            if(g_frame_idx < SAMPLE_COUNT)
-            {
-                loop_times_ms[g_frame_idx] = diff_ms(&t_proc_start, &t_proc_end);
-            }
-
         }
 
         if(count <= 0) break;
@@ -1110,27 +1021,55 @@ int main(int argc, char **argv)
                 exit(EXIT_FAILURE);
         }
     }
+    //initialize timing arrays to NaN for safety
+    for (int k = 0; k < SAMPLE_COUNT; ++k) {
+    acq_times_ms[k] = proc_times_ms[k] = write_times_ms[k] = frame_times_ms[k] = NAN;
+    }
+
 
     // initialization of V4L2
     open_device();
     init_device();
+    openlog(argv[0], LOG_PID | LOG_CONS, LOG_USER);
     start_capturing();
 
     // service loop frame read
     mainloop();
 
+    //calculate frame time 
+    for(int i = 0; i<SAMPLE_COUNT; i++){
+        frame_times_ms[i] = diff_ms(&t_frame_start[i], &t_frame_end[i]);
+    }
+
     // save final image to show processing is proper
     save_final_pgm("final_gray.pgm", dest_buf, fmt.fmt.pix.width, fmt.fmt.pix.height);
 
     //compute stats on acq, convert, and write back
-    stats_t acq_stats = compute_stats_range(acq_time_ms, warmup_frames-1, SAMPLE_COUNT-1);
-    stats_t conv_stats = compute_stats_range(conv_time_ms, warmup_frames-1, SAMPLE_COUNT-1);
-    stats_t write_stats = compute_stats_range(write_time_ms, warmup_frames-1, SAMPLE_COUNT-1);
+    stats_t acq_stats = compute_stats_range(acq_times_ms, warmup_frames, g_frame_idx-1);
+    stats_t conv_stats = compute_stats_range(proc_times_ms, warmup_frames, g_frame_idx-1);
+    stats_t write_stats = compute_stats_range(write_times_ms, warmup_frames, g_frame_idx-1);
+    stats_t frame_stats = compute_stats_range(frame_times_ms, warmup_frames, g_frame_idx-1);
+
+    syslog(LOG_INFO, "Capture complete: stored_samples=%d warmup=%d", g_frame_idx, warmup_frames);
+
+    syslog(LOG_INFO, "Acquisition ms: mean=%.3f min=%.3f max=%.3f (n=%d)",
+       acq_stats.mean, acq_stats.min, acq_stats.max, acq_stats.count);
+
+    syslog(LOG_INFO, "Conversion ms: mean=%.3f min=%.3f max=%.3f (n=%d)",
+       conv_stats.mean, conv_stats.min, conv_stats.max, conv_stats.count);
+
+    syslog(LOG_INFO, "Write ms: mean=%.3f min=%.3f max=%.3f (n=%d)",
+       write_stats.mean, write_stats.min, write_stats.max, write_stats.count);
+
+    syslog(LOG_INFO, "Full frame ms: mean=%.3f min=%.3f max=%.3f (n=%d)",
+       frame_stats.mean, frame_stats.min, frame_stats.max, frame_stats.count);
+
 
     // shutdown of frame acquisition service
     stop_capturing();
     uninit_device();
     close_device();
     fprintf(stderr, "\n");
+    closelog();
     return 0;
 }
