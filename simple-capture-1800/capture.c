@@ -341,54 +341,24 @@ void yuv2rgb(int y, int u, int v, unsigned char *r, unsigned char *g, unsigned c
 static void process_image(const void *p, int size)
 {
     int i, out_i, newsize=0;
-    struct timespec frame_time;
-    int y_temp, y2_temp, u_temp, v_temp;
     unsigned char *pptr = (unsigned char *)p;
     struct timespec t_proc_start, t_proc_end, t_write_start, t_write_end;
     size_t gray_bytes = (size_t) size/2; //grayscale conversion is half frame size
 
     // record when process was called
-    clock_gettime(CLOCK_REALTIME, &frame_time);    
+    clock_gettime(CLOCK_MONOTONIC, &t_proc_start);
 
+    //increment frame counter, once crosses 0 begin saving frames
     framecnt++;
-    printf("frame %d: ", framecnt);
 
     // This just dumps the frame to a file now, but you could replace with whatever image
     // processing you wish.
-    //
 
-    if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_GREY)
+    if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV)
     {
-        printf("Dump graymap as-is size %d\n", size);
-        dump_pgm(p, size, framecnt, &frame_time);
-    }
-
-    else if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUYV)
-    {
-
-#if defined(COLOR_CONVERT_RGB)
-       
         // Pixels are YU and YV alternating, so YUYV which is 4 bytes
-        // We want RGB, so RGBRGB which is 6 bytes
-        //
-        for(i=0, out_i=0; i<size; i=i+4, out_i=out_i+6)
-        {
-            y_temp=(int)pptr[i]; u_temp=(int)pptr[i+1]; y2_temp=(int)pptr[i+2]; v_temp=(int)pptr[i+3];
-            yuv2rgb(y_temp, u_temp, v_temp, &convert_buf[out_i], &convert_buf[out_i+1], &convert_buf[out_i+2]);
-            yuv2rgb(y2_temp, u_temp, v_temp, &convert_buf[out_i+3], &convert_buf[out_i+4], &convert_buf[out_i+5]);
-        }
-
-        if(framecnt > -1) 
-        {
-            dump_ppm(convert_buf, ((size*6)/4), framecnt, &frame_time);
-            printf("Dump YUYV converted to RGB size %d\n", size);
-        }
-#else
-       
-        // Pixels are YU and YV alternating, so YUYV which is 4 bytes
-        // We want Y, so YY which is 2 bytes
-        //
-        clock_gettime(CLOCK_MONOTONIC, &t_proc_start);
+        // We want Y, so YY which is 2 bytes        
+        
         for(i=0, out_i=0; i+3<size && out_i < (int)gray_bytes; i=i+4, out_i=out_i+2) //added +3 for safety if not %4 for some reason
         {
             // Y1=first byte and Y2=third byte
@@ -402,6 +372,9 @@ static void process_image(const void *p, int size)
                 proc_times_ms[g_frame_idx] = diff_ms(&t_proc_start, &t_proc_end);
             }
 
+        
+        /*once past 20 frames, begin a memcpy. This mimics sending to output, so the location is overwritten and one final image is saved. No saving 
+        requirements were given in the assignment so hopefully this is all that was required.*/
         if(framecnt > -1)
         {
              //copy over to destination and measure time
@@ -414,14 +387,6 @@ static void process_image(const void *p, int size)
             }
             printf("Dump YUYV converted to YY size %d\n", size);
         }
-#endif
-
-    }
-
-    else if(fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_RGB24)
-    {
-        printf("Dump RGB as-is size %d\n", size);
-        dump_ppm(p, size, framecnt, &frame_time);
     }
     else
     {
@@ -429,7 +394,6 @@ static void process_image(const void *p, int size)
     }
 
     fflush(stderr);
-    //fprintf(stderr, ".");
     fflush(stdout);
     g_frame_idx++;
 }
